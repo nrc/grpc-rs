@@ -23,7 +23,7 @@ use cc::Build;
 use cmake::Config;
 use pkg_config::{Config as PkgConfig, Library};
 
-const GRPC_VERSION: &'static str = "1.17.2";
+const GRPC_VERSION: &'static str = "1.20.0";
 
 fn probe_library(library: &str, cargo_metadata: bool) -> Library {
     match PkgConfig::new()

@@ -68,6 +68,7 @@ where
         .file
         .iter()
         .filter_map(|f| f.package.clone())
+        .map(|p| p.to_string())
         .collect();
     packages.sort();
     packages.dedup();
