@@ -11,11 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod buffers;
 pub mod client;
 pub mod server;
-mod buffers;
 
-pub use buffers::{MessageReader, MessageWriter, GrpcByteBuffer, GrpcSliceBuffer};
+pub use buffers::{MessageReader, MessageWriter};
 
 use std::sync::Arc;
 use std::{ptr, slice};
@@ -185,12 +185,12 @@ impl BatchContext {
         self.ctx
     }
 
-    pub fn take_recv_message(&self) -> Option<GrpcByteBuffer> {
+    fn take_recv_message(&self) -> Option<buffers::GrpcByteBuffer> {
         let ptr = unsafe { grpc_sys::grpcwrap_batch_context_take_recv_message(self.ctx) };
         if ptr.is_null() {
             None
         } else {
-            Some(GrpcByteBuffer { raw: ptr })
+            Some(buffers::GrpcByteBuffer { raw: ptr })
         }
     }
 
@@ -334,7 +334,7 @@ impl Call {
         let send_empty_metadata = if send_empty_metadata { 1 } else { 0 };
         let buffer = payload
             .as_mut()
-            .map_or_else(ptr::null_mut, |p| unsafe { p.as_buffer().take_raw() });
+            .map_or_else(ptr::null_mut, |p| p.as_buffer().take_raw());
         let f = check_run(BatchType::Finish, |ctx, tag| unsafe {
             let (details_ptr, details_len) = status
                 .details

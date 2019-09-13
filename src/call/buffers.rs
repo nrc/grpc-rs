@@ -14,14 +14,13 @@
 use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::{cmp, mem, ptr, usize};
 
-use crate::grpc_sys::{
-    self, grpc_byte_buffer_reader, grpc_slice,
-};
+use crate::grpc_sys::{self, grpc_byte_buffer_reader, grpc_slice};
+
 #[cfg(feature = "prost-codec")]
 use bytes::{Buf, BufMut};
 
-pub struct GrpcByteBuffer {
-    pub raw: *mut grpc_sys::grpc_byte_buffer,
+pub(super) struct GrpcByteBuffer {
+    pub(super) raw: *mut grpc_sys::grpc_byte_buffer,
 }
 
 impl GrpcByteBuffer {
@@ -31,34 +30,37 @@ impl GrpcByteBuffer {
         }
     }
 
-    pub fn pop(&mut self) {
-        unsafe { grpc_sys::grpcwrap_byte_buffer_pop(self.raw as _) }
-    }
+    // pub fn pop(&mut self) {
+    //     unsafe { grpc_sys::grpcwrap_byte_buffer_pop(self.raw as _) }
+    // }
 
     pub fn clear(&mut self) {
         unsafe { grpc_sys::grpcwrap_byte_buffer_reset_and_unref(self.raw as _) }
     }
 
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         unsafe { grpc_sys::grpc_byte_buffer_length(self.raw) }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    // pub fn is_empty(&self) -> bool {
+    //     self.len() == 0
+    // }
 
-    /// Increase the ref count, so it's mutated.
-    pub fn clone(&mut self) -> Self {
-        unsafe {
-            GrpcByteBuffer {
-                raw: grpc_sys::grpc_byte_buffer_copy(self.raw),
-            }
-        }
-    }
+    // /// Increase the ref count, so it's mutated.
+    // pub fn clone(&mut self) -> Self {
+    //     unsafe {
+    //         GrpcByteBuffer {
+    //             raw: grpc_sys::grpc_byte_buffer_copy(self.raw),
+    //         }
+    //     }
+    // }
 
-    pub unsafe fn take_raw(&mut self) -> *mut grpc_sys::grpc_byte_buffer {
+    pub fn take_raw(&mut self) -> *mut grpc_sys::grpc_byte_buffer {
         let ret = self.raw;
-        self.raw = grpc_sys::grpc_raw_byte_buffer_create(ptr::null_mut(), 0);
+        unsafe {
+            self.raw = grpc_sys::grpc_raw_byte_buffer_create(ptr::null_mut(), 0);
+        }
         ret
     }
 }
@@ -118,11 +120,15 @@ pub struct MessageReader {
 impl MessageReader {
     /// Get the available bytes count of the reader.
     #[inline]
-    pub fn pending_bytes_count(&self) -> usize {
+    fn pending_bytes_count(&self) -> usize {
         self.length
     }
 
-    pub fn new(buf: GrpcByteBuffer, reader: grpc_byte_buffer_reader, length: usize) -> MessageReader {
+    pub(super) fn new(
+        buf: GrpcByteBuffer,
+        reader: grpc_byte_buffer_reader,
+        length: usize,
+    ) -> MessageReader {
         MessageReader {
             _buf: buf,
             reader,
@@ -250,19 +256,19 @@ impl Buf for MessageReader {
     }
 }
 
-pub struct GrpcSliceBuffer {
+struct GrpcSliceBuffer {
     buffer: grpc_slice,
     buffer_offset: usize,
 }
 
 impl GrpcSliceBuffer {
-    pub fn is_full(&self) -> bool {
+    fn is_full(&self) -> bool {
         self.buffer.len() - self.buffer_offset == 0
     }
 
-    /// Returns the remaining slice, `None` means fully consumed
-    pub fn append<'a>(&mut self, data: &'a [u8]) -> Option<&'a [u8]> {
-        let internal_slice = unsafe { self.buffer.range_from_unsafe(self.buffer_offset) };
+    // Returns the remaining slice, `None` means fully consumed
+    fn append<'a>(&mut self, data: &'a [u8]) -> Option<&'a [u8]> {
+        let internal_slice = self.buffer.range_from(self.buffer_offset);
         let data_len = data.len();
         let internal_len = internal_slice.len();
         if data_len > internal_len {
@@ -332,11 +338,11 @@ impl MessageWriter {
         })
     }
 
-    pub fn into_buffer(self) -> GrpcByteBuffer {
-        self.data
+    pub(super) fn into_raw(mut self) -> *mut grpc_sys::grpc_byte_buffer {
+        self.data.take_raw()
     }
 
-    pub fn as_buffer(&mut self) -> &mut GrpcByteBuffer {
+    pub(super) fn as_buffer(&mut self) -> &mut GrpcByteBuffer {
         &mut self.data
     }
 
@@ -359,9 +365,8 @@ impl MessageWriter {
     }
 
     fn append_buf_to_reserved<'a>(&mut self, buf: &'a [u8]) -> Option<&'a [u8]> {
-        use std::mem::swap;
         let mut dummy_buffer = None;
-        swap(&mut dummy_buffer, &mut self.reserved_buffer);
+        mem::swap(&mut dummy_buffer, &mut self.reserved_buffer);
         match dummy_buffer {
             Some(mut buffer) => {
                 let rest = buffer.append(buf);
@@ -378,8 +383,7 @@ impl MessageWriter {
         }
     }
 
-    /// Returns the rest
-    pub fn write_safe(&mut self, buf: &[u8]) {
+    pub fn append(&mut self, buf: &[u8]) {
         if let Some(rest) = self.append_buf_to_reserved(buf) {
             self.append_slice_to_data(From::from(rest));
         }
@@ -388,18 +392,19 @@ impl MessageWriter {
 
 impl Write for MessageWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_safe(buf);
+        self.append(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        use std::mem::swap;
         let mut dummy_buffer = None;
-        swap(&mut dummy_buffer, &mut self.reserved_buffer);
+        mem::swap(&mut dummy_buffer, &mut self.reserved_buffer);
 
         if let Some(buffer) = dummy_buffer {
-            // 0-sized buffers shouldn't haven been created
-            debug_assert!(buffer.buffer_offset > 0);
+            debug_assert!(
+                buffer.buffer_offset > 0,
+                "0-sized buffers shouldn't have been created"
+            );
             self.append_slice_to_data(if buffer.is_full() {
                 // Current buffer is filled
                 buffer.buffer
@@ -439,15 +444,13 @@ mod tests {
     #[test]
     fn byte_buffer_empty() {
         let mut buf = GrpcByteBuffer::default();
-        unsafe {
-            assert_eq!(
-                0,
-                GrpcByteBuffer {
-                    raw: buf.take_raw(),
-                }
-                .len()
-            );
-        }
+        assert_eq!(
+            0,
+            GrpcByteBuffer {
+                raw: buf.take_raw(),
+            }
+            .len()
+        );
         assert_eq!(0, buf.len());
     }
 
@@ -456,15 +459,13 @@ mod tests {
         let mut buf = GrpcByteBuffer::default();
         let data = "oh my god!".as_bytes();
         buf.push(From::from(data));
-        unsafe {
-            assert_eq!(
-                data.len(),
-                GrpcByteBuffer {
-                    raw: buf.take_raw(),
-                }
-                .len()
-            );
-        }
+        assert_eq!(
+            data.len(),
+            GrpcByteBuffer {
+                raw: buf.take_raw(),
+            }
+            .len()
+        );
         buf.clear();
         assert_eq!(0, buf.len());
     }
@@ -623,7 +624,7 @@ mod tests {
     fn test_message_writer() {
         let mut writer = MessageWriter::new();
         assert_eq!(writer.len(), 0);
-        writer.write_safe("114".as_bytes());
+        writer.append("114".as_bytes());
         assert_eq!(writer.len(), 3);
         writer.write("514".as_bytes()).unwrap();
         assert_eq!(writer.len(), 6);
@@ -634,7 +635,7 @@ mod tests {
     fn test_message_writer_reserve() {
         let mut writer = MessageWriter::new();
         writer.reserve(3);
-        writer.write_safe(&[1]);
+        writer.append(&[1]);
         // Longer than 2
         let text = "TiDB will rule the world!".as_bytes();
         writer.write(text).unwrap();
