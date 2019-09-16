@@ -5857,6 +5857,15 @@ extern "C" {
     pub fn grpcwrap_slice_length(slice: *const grpc_slice) -> usize;
 }
 extern "C" {
+    pub fn grpcwrap_byte_buffer_add(buf: *mut grpc_byte_buffer, slice: grpc_slice);
+}
+extern "C" {
+    pub fn grpcwrap_byte_buffer_reset_and_unref(buf: *mut grpc_byte_buffer);
+}
+extern "C" {
+    pub fn grpcwrap_byte_buffer_pop(buf: *mut grpc_byte_buffer);
+}
+extern "C" {
     pub fn grpcwrap_batch_context_take_recv_message(
         ctx: *mut grpcwrap_batch_context,
     ) -> *mut grpc_byte_buffer;
@@ -5953,8 +5962,7 @@ extern "C" {
     pub fn grpcwrap_call_start_unary(
         call: *mut grpc_call,
         ctx: *mut grpcwrap_batch_context,
-        send_buffer: *const ::std::os::raw::c_char,
-        send_buffer_len: usize,
+        buffer: *mut grpc_byte_buffer,
         write_flags: u32,
         initial_metadata: *mut grpc_metadata_array,
         initial_metadata_flags: u32,
@@ -5974,8 +5982,7 @@ extern "C" {
     pub fn grpcwrap_call_start_server_streaming(
         call: *mut grpc_call,
         ctx: *mut grpcwrap_batch_context,
-        send_buffer: *const ::std::os::raw::c_char,
-        send_buffer_len: usize,
+        send_buffer: *mut grpc_byte_buffer,
         write_flags: u32,
         initial_metadata: *mut grpc_metadata_array,
         initial_metadata_flags: u32,
@@ -6002,8 +6009,7 @@ extern "C" {
     pub fn grpcwrap_call_send_message(
         call: *mut grpc_call,
         ctx: *mut grpcwrap_batch_context,
-        send_buffer: *const ::std::os::raw::c_char,
-        send_buffer_len: usize,
+        send_buffer: *mut grpc_byte_buffer,
         write_flags: u32,
         send_empty_initial_metadata: i32,
         tag: *mut ::std::os::raw::c_void,
@@ -6024,8 +6030,7 @@ extern "C" {
         status_details_len: usize,
         trailing_metadata: *mut grpc_metadata_array,
         send_empty_initial_metadata: i32,
-        optional_send_buffer: *const ::std::os::raw::c_char,
-        optional_send_buffer_len: usize,
+        optional_send_buffer: *mut grpc_byte_buffer,
         write_flags: u32,
         tag: *mut ::std::os::raw::c_void,
     ) -> grpc_call_error;
