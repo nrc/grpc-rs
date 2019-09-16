@@ -28,28 +28,22 @@ pub struct MessageReader {
     reader: GrpcByteBufferReader,
     buffer_slice: GrpcSlice,
     buffer_offset: usize,
-    length: usize,
+    remaining: usize,
 }
 
 impl MessageReader {
-    /// Get the available bytes count of the reader.
-    #[inline]
-    fn pending_bytes_count(&self) -> usize {
-        self.length
-    }
-
     /// Create a new `MessageReader`.
     ///
     /// Safety: `raw` must be a unique reference.
     pub unsafe fn new(raw: *mut grpc_byte_buffer) -> MessageReader {
         let reader = GrpcByteBufferReader::new(raw);
-        let length = reader.len();
+        let remaining = reader.len();
 
         MessageReader {
             reader,
             buffer_slice: Default::default(),
             buffer_offset: 0,
-            length,
+            remaining,
         }
     }
 }
@@ -68,19 +62,20 @@ impl Read for MessageReader {
             buf[..amt].copy_from_slice(&bytes[..amt]);
             amt
         };
+
         self.consume(amt);
         Ok(amt)
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        if self.length == 0 {
+        if self.remaining == 0 {
             return Ok(0);
         }
-        buf.reserve(self.length);
+        buf.reserve(self.remaining);
         let start = buf.len();
         let mut len = start;
         unsafe {
-            buf.set_len(start + self.length);
+            buf.set_len(start + self.remaining);
         }
         let ret = loop {
             match self.read(&mut buf[len..]) {
@@ -100,7 +95,7 @@ impl Read for MessageReader {
 impl BufRead for MessageReader {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         // Optimization for empty slice
-        if self.pending_bytes_count() == 0 {
+        if self.remaining == 0 {
             return Ok(&[]);
         }
 
@@ -116,7 +111,7 @@ impl BufRead for MessageReader {
     }
 
     fn consume(&mut self, amt: usize) {
-        self.length -= amt;
+        self.remaining -= amt;
         self.buffer_offset += amt;
     }
 }
@@ -124,7 +119,7 @@ impl BufRead for MessageReader {
 #[cfg(feature = "prost-codec")]
 impl Buf for MessageReader {
     fn remaining(&self) -> usize {
-        self.pending_bytes_count()
+        self.remaining
     }
 
     fn bytes(&self) -> &[u8] {
@@ -149,7 +144,7 @@ impl Buf for MessageReader {
         let mut remaining = self.buffer_slice.len() - self.buffer_offset;
         while remaining <= cnt {
             self.consume(remaining);
-            if self.pending_bytes_count() == 0 {
+            if self.remaining == 0 {
                 return;
             }
 
@@ -334,7 +329,7 @@ mod tests {
         // half of the size of `data`
         const HALF_SIZE: usize = 4;
         let mut reader = make_message_reader(&data, 1);
-        assert_eq!(reader.pending_bytes_count(), data.len());
+        assert_eq!(reader.remaining, data.len());
         // first 3 elements of `data`
         let mut buf = [0; HALF_SIZE];
         reader.read(&mut buf).unwrap();
@@ -379,7 +374,7 @@ mod tests {
                 reader.read_to_end(&mut dest).unwrap();
                 assert_eq!(dest, expect, "len: {}, nslice: {}", len, n_slice);
 
-                assert_eq!(0, reader.pending_bytes_count());
+                assert_eq!(0, reader.remaining);
                 assert_eq!(0, reader.read(&mut [1]).unwrap())
             }
         }
