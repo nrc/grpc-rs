@@ -20,6 +20,9 @@ extern crate grpcio_proto as grpc_proto;
 extern crate log;
 extern crate rand;
 
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use std::env;
 use std::sync::Arc;
 
