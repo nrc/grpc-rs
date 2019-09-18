@@ -177,8 +177,12 @@ impl MessageWriter {
 
     pub fn reserve(&mut self, size: usize) -> &mut [u8] {
         let new_len = self.write_buffer.len() + size;
-        self.write_buffer.resize(new_len, 0);
-        &mut self.write_buffer
+        //self.write_buffer.resize(new_len, 0);
+        self.write_buffer.reserve(size);
+        unsafe {
+            self.write_buffer.set_len(new_len);
+            &mut self.write_buffer
+        }
     }
 
     // Unsafe because the caller takes responsibility for destroying the returned
