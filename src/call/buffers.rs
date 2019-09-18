@@ -91,14 +91,12 @@ impl Drop for GrpcByteBufferReader {
     }
 }
 
-fn vec_slice(v: Vec<u8>) -> Box<grpc_slice> {
+unsafe fn vec_slice(v: Vec<u8>) -> Box<grpc_slice> {
     let mut data = grpc_sys::grpc_slice_grpc_slice_data::default();
-    unsafe {
-        *data.refcounted.as_mut() = grpc_sys::grpc_slice_grpc_slice_data_grpc_slice_refcounted {
-            bytes: v.as_ptr() as *const _ as *mut _,
-            length: v.len(),
-        };
-    }
+    *data.refcounted.as_mut() = grpc_sys::grpc_slice_grpc_slice_data_grpc_slice_refcounted {
+        bytes: v.as_ptr() as *const _ as *mut _,
+        length: v.len(),
+    };
     let mut refcount = VecSliceRefCount::new(v);
     let mut result = Box::new(grpc_slice {
         refcount: ptr::null_mut(),
@@ -120,12 +118,13 @@ struct VecSliceRefCount {
 }
 
 impl VecSliceRefCount {
-    fn new(vec: Vec<u8>) -> Box<VecSliceRefCount> {
+    // TODO comment - no ref count
+    unsafe fn new(vec: Vec<u8>) -> Box<VecSliceRefCount> {
         let mut result = Box::new(VecSliceRefCount {
             vtable: &VEC_SLICE_VTABLE,
             sub_refcount: ptr::null_mut(),
             vec,
-            count: 1,
+            count: 0,
             slice: ptr::null_mut(),
         });
         result.sub_refcount = &*result as *const _ as *mut _;
