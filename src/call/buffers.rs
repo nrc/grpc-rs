@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use std::io::{self, BufRead, ErrorKind, Read};
-use std::{cmp, mem, ptr, slice, usize};
+use std::{cmp, mem::{self, MaybeUninit}, ptr, slice, usize};
 
 use crate::grpc_sys::{
     self, grpc_byte_buffer, grpc_slice, grpc_slice_refcount_vtable, grpc_byte_buffer_reader, grpc_slice_refcount,
@@ -62,10 +62,10 @@ struct GrpcByteBufferReader(grpc_byte_buffer_reader);
 impl GrpcByteBufferReader {
     fn new(buf: *mut grpc_byte_buffer) -> GrpcByteBufferReader {
         unsafe {
-            let mut reader = mem::zeroed();
-            let init_result = grpc_sys::grpc_byte_buffer_reader_init(&mut reader, buf);
+            let mut reader = MaybeUninit::uninit();
+            let init_result = grpc_sys::grpc_byte_buffer_reader_init(reader.as_mut_ptr(), buf);
             assert_eq!(init_result, 1);
-            GrpcByteBufferReader(reader)
+            GrpcByteBufferReader(reader.assume_init())
         }
     }
 
