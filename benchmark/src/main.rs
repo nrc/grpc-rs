@@ -21,7 +21,8 @@ extern crate log;
 extern crate rand;
 
 #[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+//static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+static ALLOC: tcmalloc::TCMalloc = tcmalloc::TCMalloc;
 
 use std::env;
 use std::sync::Arc;
