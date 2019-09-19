@@ -51,12 +51,6 @@ impl Drop for GrpcSlice {
     }
 }
 
-impl<'a> From<&'a [u8]> for GrpcSlice {
-    fn from(data: &'a [u8]) -> Self {
-        GrpcSlice(unsafe { grpc_sys::grpc_slice_from_copied_buffer(data.as_ptr() as _, data.len()) })
-    }
-}
-
 struct GrpcByteBufferReader(grpc_byte_buffer_reader);
 
 impl GrpcByteBufferReader {
