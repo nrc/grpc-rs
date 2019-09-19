@@ -12,11 +12,13 @@
 // limitations under the License.
 
 use std::io::{self, BufRead, ErrorKind, Read};
-use std::{cmp, mem::{self, MaybeUninit}, ptr, slice, usize};
-
-use crate::grpc_sys::{
-    self, grpc_byte_buffer, grpc_slice, grpc_slice_refcount_vtable, grpc_byte_buffer_reader, grpc_slice_refcount,
+use std::{
+    cmp,
+    mem::{self, MaybeUninit},
+    slice, usize,
 };
+
+use crate::grpc_sys::{self, grpc_byte_buffer, grpc_byte_buffer_reader, grpc_slice};
 
 #[cfg(feature = "prost-codec")]
 use bytes::{Buf, BufMut};
@@ -54,14 +56,15 @@ impl Drop for GrpcSlice {
 struct GrpcByteBufferReader(grpc_byte_buffer_reader);
 
 impl GrpcByteBufferReader {
-    // TODO takes ownership of buf
+    /// Create a wrapper around a `grpc_byte_buffer_reader` reading from `buf`.
+    ///
+    /// Safety: this `GrpcByteBufferReader` takes ownership of `buf` and will
+    /// destroy it. `buf` must be valid when this method is called.
     unsafe fn new(buf: *mut grpc_byte_buffer) -> GrpcByteBufferReader {
-        unsafe {
-            let mut reader = MaybeUninit::uninit();
-            let init_result = grpc_sys::grpc_byte_buffer_reader_init(reader.as_mut_ptr(), buf);
-            assert_eq!(init_result, 1);
-            GrpcByteBufferReader(reader.assume_init())
-        }
+        let mut reader = MaybeUninit::uninit();
+        let init_result = grpc_sys::grpc_byte_buffer_reader_init(reader.as_mut_ptr(), buf);
+        assert_eq!(init_result, 1);
+        GrpcByteBufferReader(reader.assume_init())
     }
 
     fn len(&self) -> usize {
@@ -88,69 +91,6 @@ impl Drop for GrpcByteBufferReader {
     }
 }
 
-unsafe fn vec_slice(v: Vec<u8>) -> Box<grpc_slice> {
-    let mut data = grpc_sys::grpc_slice_grpc_slice_data::default();
-    *data.refcounted.as_mut() = grpc_sys::grpc_slice_grpc_slice_data_grpc_slice_refcounted {
-        bytes: v.as_ptr() as *const _ as *mut _,
-        length: v.len(),
-    };
-    let mut refcount = VecSliceRefCount::new(v);
-    let mut result = Box::new(grpc_slice {
-        refcount: ptr::null_mut(),
-        data,
-    });
-    refcount.slice = result.as_mut();
-    result.refcount = Box::into_raw(refcount) as *mut _;
-    result
-}
-
-// comment: grpc_slice_refcount
-#[repr(C)]
-struct VecSliceRefCount {
-    vtable: *const grpc_slice_refcount_vtable,
-    sub_refcount: *mut grpc_slice_refcount,
-    vec: Vec<u8>,
-    count: usize,
-    slice: *mut grpc_slice,
-}
-
-impl VecSliceRefCount {
-    // TODO comment - no ref count
-    unsafe fn new(vec: Vec<u8>) -> Box<VecSliceRefCount> {
-        let mut result = Box::new(VecSliceRefCount {
-            vtable: &VEC_SLICE_VTABLE,
-            sub_refcount: ptr::null_mut(),
-            vec,
-            count: 0,
-            slice: ptr::null_mut(),
-        });
-        result.sub_refcount = &*result as *const _ as *mut _;
-        result
-    }
-}
-
-static VEC_SLICE_VTABLE: grpc_slice_refcount_vtable = grpc_slice_refcount_vtable {
-    ref_: Some(vec_slice_ref),
-    unref: Some(vec_slice_unref),
-    eq: Some(grpc_sys::grpc_slice_default_eq_impl),
-    hash: Some(grpc_sys::grpc_slice_default_hash_impl),
-};
-
-unsafe extern "C" fn vec_slice_ref(arg1: *mut ::std::os::raw::c_void) {
-    let refcount = arg1 as *mut VecSliceRefCount;
-    (*refcount).count += 1;
-}
-unsafe extern "C" fn vec_slice_unref(arg1: *mut ::std::os::raw::c_void) {
-    let refcount = arg1 as *mut VecSliceRefCount;
-    (*refcount).count -= 1;
-    if (*refcount).count == 0 {
-        let refcount = Box::from_raw(refcount);
-        let slice = Box::from_raw(refcount.slice);
-        mem::drop(refcount);
-        mem::drop(slice);
-    }
-}
-
 /// `MessageReader` is a zero-copy reader for the message payload.
 ///
 /// To achieve zero-copy, use the BufRead API `fill_buf` and `consume`
@@ -162,10 +102,14 @@ pub struct MessageReader {
     remaining: usize,
 }
 
+unsafe impl Send for MessageReader {}
+
 impl MessageReader {
     /// Create a new `MessageReader`.
     ///
-    /// Safety: `raw` must be a unique reference. TODO - take ownership
+    /// Safety: `raw` must be a unique reference. The `MessageReader` takes
+    /// ownership of `raw` and will destroy it, the caller should not use the
+    /// reference after calling this method.
     pub unsafe fn new(raw: *mut grpc_byte_buffer) -> MessageReader {
         let reader = GrpcByteBufferReader::new(raw);
         let remaining = reader.len();
@@ -178,9 +122,6 @@ impl MessageReader {
         }
     }
 }
-
-unsafe impl Sync for MessageReader {}
-unsafe impl Send for MessageReader {}
 
 impl Read for MessageReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -290,6 +231,7 @@ impl Buf for MessageReader {
 }
 
 pub struct MessageWriter {
+    // TODO recycle Vecs
     pub write_buffer: Vec<u8>,
 }
 
@@ -315,12 +257,11 @@ impl MessageWriter {
     }
 
     // Unsafe because the caller takes responsibility for destroying the returned
-    // byte buffer. Clears the internal buffer.
+    // byte buffer. Consumes and clears the internal buffer.
     pub unsafe fn byte_buffer(&mut self) -> *mut grpc_byte_buffer {
         let mut vec = Vec::new();
         mem::swap(&mut self.write_buffer, &mut vec);
-        let slice = vec_slice(vec);
-        grpc_sys::grpc_raw_byte_buffer_create(Box::into_raw(slice), 1)
+        grpc_sys::grpc_raw_byte_buffer_create(alloc::vec_slice(vec), 1)
     }
 }
 
@@ -352,6 +293,285 @@ impl<'a> BufMut for MessageWriterBuf<'a> {
 
     unsafe fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.inner.write_buffer[self.offset..]
+    }
+}
+
+// TODO update comments
+// The below thread-locals and functions are for arena allocating some of the small
+// data structures which grpc requires for slices (and which can't be stack allocated).
+// Allocating these on the heap gets expensive when sending many small messages.
+//
+// If we fill our arenas, then `alloc` will use `Box` to allocate on the heap.
+//
+// Our arenas are kept in sync (treat this allocator as having a single arena).
+// We track the start and end of an occupied zone (which may have some freed data
+// inside).
+mod alloc {
+    use std::{cell::Cell, mem, ptr, usize};
+
+    use crate::grpc_sys::{self, grpc_slice, grpc_slice_refcount, grpc_slice_refcount_vtable};
+
+    // The size of our arenas in number of items per thread.
+    // TODO value
+    const ARENA_SIZE: u32 = 4000;
+
+    thread_local! {
+        // An arena for allocating `VecSlice`s. These are smart-pointer-like objects
+        // which hold a pointer to the data itself.
+        static SLICE_ARENA: [VecSlice; ARENA_SIZE as usize] = unsafe {
+            mem::transmute(mem::zeroed::<[u8; ARENA_SIZE as usize * mem::size_of::<VecSlice>()]>())
+        };
+        static ARENA_MIN: Cell<usize> = Cell::new(0);
+        static ARENA_MAX: Cell<usize> = Cell::new(0);
+    }
+
+    // Returned data is partially initialised. Why is this safe?
+    unsafe fn alloc() -> *mut VecSlice {
+        let min = ARENA_MIN.with(|i| i.get());
+        let index = if min > 0 {
+            let index = min - 1;
+            ARENA_MIN.with(|i| i.set(index));
+            index
+        } else {
+            let max = ARENA_MAX.with(|i| i.get());
+            debug_assert!(max <= ARENA_SIZE as usize);
+            if max == ARENA_SIZE as usize {
+                // TODO remove
+                eprintln!("boxing");
+                let slice: *mut VecSlice = Box::into_raw(Box::new(mem::zeroed()));
+                (*slice).boxed = ARENA_SIZE;
+                return slice;
+            }
+
+            ARENA_MAX.with(|i| i.set(max + 1));
+            max
+        };
+
+        let slice: *mut VecSlice = SLICE_ARENA.with(|a| &a[index] as *const _ as *mut _);
+        debug_assert!((*slice).vtable == ptr::null());
+        (*slice).boxed = index as u32;
+        slice
+    }
+
+    unsafe fn free(slice: *mut VecSlice, index: u32) {
+        debug_assert!((*slice).boxed == index && index < ARENA_SIZE);
+        (*slice).vtable = ptr::null();
+
+        let mut next = ARENA_MAX.with(|i| i.get());
+        let mut prev = ARENA_MIN.with(|i| i.get());
+        if prev as u32 == index && prev + 1 < next {
+            let prev = SLICE_ARENA.with(|a| {
+                while prev + 1 < next && a[prev].vtable == ptr::null() {
+                    prev += 1
+                }
+                prev
+            });
+            ARENA_MIN.with(|i| i.set(prev));
+        } else if next as u32 - 1 == index {
+            let next = SLICE_ARENA.with(|a| {
+                while next > 0 && a[next - 1].vtable == ptr::null() {
+                    next -= 1
+                }
+                next
+            });
+            ARENA_MAX.with(|i| i.set(next));
+        }
+    }
+
+    pub unsafe fn vec_slice(v: Vec<u8>) -> *mut grpc_slice {
+        let mut data = grpc_sys::grpc_slice_grpc_slice_data::default();
+        // FIXME use inlined slices (without allocation) for < 8 bytes.
+        *data.refcounted.as_mut() = grpc_sys::grpc_slice_grpc_slice_data_grpc_slice_refcounted {
+            bytes: v.as_ptr() as *const _ as *mut _,
+            length: v.len(),
+        };
+        let slice = alloc();
+        let result = &mut (*slice).slice;
+        (*result).data = data;
+        (*result).refcount = slice as *mut _;
+        (*slice).vtable = &VEC_SLICE_VTABLE;
+        (*slice).sub_refcount = slice as *mut _;
+        (*slice).vec = Some(v);
+        (*slice).count = 0;
+        result
+    }
+
+    // comment: grpc_slice_refcount
+    #[repr(C)]
+    struct VecSlice {
+        vtable: *const grpc_slice_refcount_vtable,
+        sub_refcount: *mut grpc_slice_refcount,
+        vec: Option<Vec<u8>>,
+        count: u32,
+        boxed: u32,
+        slice: grpc_slice,
+    }
+
+    static VEC_SLICE_VTABLE: grpc_slice_refcount_vtable = grpc_slice_refcount_vtable {
+        ref_: Some(vec_slice_ref),
+        unref: Some(vec_slice_unref),
+        eq: Some(grpc_sys::grpc_slice_default_eq_impl),
+        hash: Some(grpc_sys::grpc_slice_default_hash_impl),
+    };
+
+    unsafe extern "C" fn vec_slice_ref(arg1: *mut ::std::os::raw::c_void) {
+        let refcount = arg1 as *mut VecSlice;
+        (*refcount).count += 1;
+    }
+
+    unsafe extern "C" fn vec_slice_unref(arg1: *mut ::std::os::raw::c_void) {
+        let refcount = arg1 as *mut VecSlice;
+        (*refcount).count -= 1;
+        if (*refcount).count == 0 {
+            let boxed = (*refcount).boxed;
+            if boxed == ARENA_SIZE {
+                let refcount = Box::from_raw(refcount);
+                mem::drop(refcount);
+            } else {
+                let vec = (*refcount).vec.take();
+                mem::drop(vec);
+                free(refcount, boxed);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::mem::MaybeUninit;
+
+        #[test]
+        fn test_alloc() {
+            unsafe {
+                for _ in 0..6 {
+                    alloc();
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 6);
+
+                for _ in 0..ARENA_SIZE {
+                    alloc();
+                }
+                // We'll have allocated `ARENA_SIZE + 6` times by now, but the last 6
+                // should have been heap-allocated because the arenas are full.
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), ARENA_SIZE as usize);
+            }
+            // Test will leak all slices.
+        }
+
+        #[test]
+        fn test_free() {
+            // This test allocs and frees vc slices in various orders to test
+            // that the alloc and free mechanisms work as expected.
+            unsafe {
+                let mut data = vec![];
+                for _ in 0..10 {
+                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                while let Some(datum) = data.pop() {
+                    // We have to ref and unref because the slices are returned with
+                    // 0 refcount.
+                    vec_slice_ref((*datum).refcount as *mut _);
+                    vec_slice_unref((*datum).refcount as *mut _);
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 0);
+
+                for _ in 0..10 {
+                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                for datum in data.into_iter().skip(2) {
+                    vec_slice_ref((*datum).refcount as *mut _);
+                    vec_slice_unref((*datum).refcount as *mut _);
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 2);
+            }
+            // Test will leak some slices.
+        }
+
+        #[test]
+        fn test_free_min() {
+            unsafe {
+                let mut data = vec![];
+                for _ in 0..10 {
+                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                for datum in data.into_iter().take(5) {
+                    vec_slice_ref((*datum).refcount as *mut _);
+                    vec_slice_unref((*datum).refcount as *mut _);
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                let mut data = vec![];
+                for _ in 0..3 {
+                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 2);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                while let Some(datum) = data.pop() {
+                    vec_slice_ref((*datum).refcount as *mut _);
+                    vec_slice_unref((*datum).refcount as *mut _);
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+            }
+            // Test will leak some slices.
+        }
+
+        #[test]
+        fn test_free_bb() {
+            // Use the grpc 'byte_buffer` interfaces to test we call ref/unref correctly
+            // and use `byte_buffer_reader` to check the contents of the slice.
+            unsafe {
+                let mut data = vec![];
+                for _ in 0..10 {
+                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                for datum in data.into_iter().take(5) {
+                    let bb = grpc_sys::grpc_raw_byte_buffer_create(datum, 1);
+                    let mut reader = MaybeUninit::uninit();
+                    grpc_sys::grpc_byte_buffer_reader_init(reader.as_mut_ptr(), bb);
+                    let mut reader = reader.assume_init();
+                    let mut slice = MaybeUninit::uninit();
+                    assert_eq!(
+                        grpc_sys::grpc_byte_buffer_reader_next(&mut reader, slice.as_mut_ptr()),
+                        1
+                    );
+                    let slice = slice.assume_init();
+                    let bytes = slice.data.refcounted.as_ref().bytes;
+                    for i in 0..5 {
+                        assert_eq!(*bytes.offset(i), (i + 1) as u8);
+                    }
+                    grpc_sys::grpc_slice_unref(slice);
+                    grpc_sys::grpc_byte_buffer_reader_destroy(&mut reader);
+                    grpc_sys::grpc_byte_buffer_destroy(bb);
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                let mut data = vec![];
+                for _ in 0..3 {
+                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 2);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                while let Some(datum) = data.pop() {
+                    let bb = grpc_sys::grpc_raw_byte_buffer_create(datum, 1);
+                    grpc_sys::grpc_byte_buffer_destroy(bb);
+                }
+                assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
+                assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+            }
+        }
     }
 }
 
