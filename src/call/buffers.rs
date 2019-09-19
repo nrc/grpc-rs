@@ -54,7 +54,8 @@ impl Drop for GrpcSlice {
 struct GrpcByteBufferReader(grpc_byte_buffer_reader);
 
 impl GrpcByteBufferReader {
-    fn new(buf: *mut grpc_byte_buffer) -> GrpcByteBufferReader {
+    // TODO takes ownership of buf
+    unsafe fn new(buf: *mut grpc_byte_buffer) -> GrpcByteBufferReader {
         unsafe {
             let mut reader = MaybeUninit::uninit();
             let init_result = grpc_sys::grpc_byte_buffer_reader_init(reader.as_mut_ptr(), buf);
@@ -80,7 +81,9 @@ impl GrpcByteBufferReader {
 impl Drop for GrpcByteBufferReader {
     fn drop(&mut self) {
         unsafe {
+            let buf = self.0.buffer_in;
             grpc_sys::grpc_byte_buffer_reader_destroy(&mut self.0);
+            grpc_sys::grpc_byte_buffer_destroy(buf);
         }
     }
 }
@@ -162,7 +165,7 @@ pub struct MessageReader {
 impl MessageReader {
     /// Create a new `MessageReader`.
     ///
-    /// Safety: `raw` must be a unique reference.
+    /// Safety: `raw` must be a unique reference. TODO - take ownership
     pub unsafe fn new(raw: *mut grpc_byte_buffer) -> MessageReader {
         let reader = GrpcByteBufferReader::new(raw);
         let remaining = reader.len();
