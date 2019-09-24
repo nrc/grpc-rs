@@ -15,6 +15,7 @@ use std::io::{self, BufRead, ErrorKind, Read};
 use std::{
     cmp,
     mem::{self, MaybeUninit},
+    ptr::{self, NonNull},
     slice, usize,
 };
 
@@ -230,38 +231,137 @@ impl Buf for MessageReader {
     }
 }
 
+#[derive(Clone)]
 pub struct MessageWriter {
-    // TODO recycle Vecs
-    pub write_buffer: Vec<u8>,
+    internal: NonNull<WriterInternal>,
+}
+
+unsafe impl Send for MessageWriter {}
+
+//impl !Send for MessageWriter {}
+//impl !Sync for MessageWriter {}
+
+impl Drop for MessageWriter {
+    fn drop(&mut self) {
+        unsafe {
+            if self.internal.as_ref().count > 0 {
+                self.internal.as_mut().count -= 1;
+            }
+
+            if self.internal.as_ref().count == 0 {
+                alloc::free_writer(self.internal.as_ptr());
+            }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct WriterInternal {
+    slice: Option<VecSlice>,
+    // Vec.len is always 0, except after reserve() and before byte_buffer()
+    write_buffer: Option<Vec<u8>>,
+    boxed: u32,
+    count: u32,
+}
+
+// comment: grpc_slice_refcount
+#[repr(C)]
+struct VecSlice {
+    vtable: ptr::NonNull<grpc_sys::grpc_slice_refcount_vtable>,
+    sub_refcount: *mut grpc_sys::grpc_slice_refcount,
+    slice: grpc_slice,
+}
+
+#[test]
+fn assert_slice_sizes() {
+    assert_eq!(
+        ::std::mem::size_of::<VecSlice>(),
+        ::std::mem::size_of::<Option<VecSlice>>()
+    );
 }
 
 impl MessageWriter {
     /// Create an empty MessageWriter.
     pub fn new() -> MessageWriter {
         MessageWriter {
-            write_buffer: Vec::new(),
+            internal: NonNull::new(alloc::alloc_writer())
+                .expect("alloc_writer could not allocate?"),
         }
     }
 
-    pub fn clear(&mut self) {
-        self.write_buffer.clear();
-    }
-
     pub fn reserve(&mut self, size: usize) -> &mut [u8] {
-        let new_len = self.write_buffer.len() + size;
-        self.write_buffer.reserve(size);
+        let buf = unsafe { (*self.internal.as_ptr()).write_buffer.as_mut().unwrap() };
+        let new_len = buf.len() + size;
+        buf.reserve(size);
         unsafe {
-            self.write_buffer.set_len(new_len);
-            &mut self.write_buffer
+            buf.set_len(new_len);
+            buf
         }
     }
 
     // Unsafe because the caller takes responsibility for destroying the returned
     // byte buffer. Consumes and clears the internal buffer.
     pub unsafe fn byte_buffer(&mut self) -> *mut grpc_byte_buffer {
-        let mut vec = Vec::new();
-        mem::swap(&mut self.write_buffer, &mut vec);
-        grpc_sys::grpc_raw_byte_buffer_create(alloc::vec_slice(vec), 1)
+        let internal = alloc::alloc_writer();
+        let mut temp = self.internal.as_ptr();
+        self.internal = NonNull::new(internal).unwrap();
+        (*temp).count -= 1;
+        // FIXME: sadly we have a really simple buffer (one slice), but grpc core insists on
+        // wrapping that in a slice buffer in a byte buffer, the latter of which causes a tiny
+        // allocation. I don't think we can avoid this and still use grpc core.
+        grpc_sys::grpc_raw_byte_buffer_create((*temp).ensure_slice(), 1)
+    }
+}
+
+impl WriterInternal {
+    unsafe fn ensure_slice(&mut self) -> *mut grpc_slice {
+        if self.slice.is_none() {
+            self.init_slice();
+        }
+
+        debug_assert!(self.slice.is_some());
+        debug_assert!(&self.slice as *const _ as *const () == self as *const _ as *const ());
+        &mut self.slice.as_mut().unwrap().slice as *mut _ as *mut grpc_slice
+    }
+
+    unsafe fn init_slice(&mut self) {
+        let mut slice = VecSlice {
+            slice: grpc_slice {
+                data: Default::default(),
+                refcount: self as *mut _ as *mut _,
+            },
+            sub_refcount: self as *mut _ as *mut _,
+            vtable: NonNull::new(&VEC_SLICE_VTABLE as *const _ as *mut _).unwrap(),
+        };
+        *slice.slice.data.refcounted.as_mut() =
+            grpc_sys::grpc_slice_grpc_slice_data_grpc_slice_refcounted {
+                bytes: self.write_buffer.as_ref().unwrap().as_ptr() as *const _ as *mut _,
+                length: self.write_buffer.as_ref().unwrap().len(),
+            };
+
+        mem::swap(&mut self.slice, &mut Some(slice));
+    }
+}
+
+static VEC_SLICE_VTABLE: grpc_sys::grpc_slice_refcount_vtable =
+    grpc_sys::grpc_slice_refcount_vtable {
+        ref_: Some(vec_slice_ref),
+        unref: Some(vec_slice_unref),
+        eq: Some(grpc_sys::grpc_slice_default_eq_impl),
+        hash: Some(grpc_sys::grpc_slice_default_hash_impl),
+    };
+
+unsafe extern "C" fn vec_slice_ref(arg1: *mut ::std::os::raw::c_void) {
+    let refcount = arg1 as *mut WriterInternal;
+    (*refcount).count += 1;
+}
+
+unsafe extern "C" fn vec_slice_unref(arg1: *mut ::std::os::raw::c_void) {
+    let refcount = arg1 as *mut WriterInternal;
+    (*refcount).count -= 1;
+    if (*refcount).count == 0 {
+        alloc::free_writer(refcount);
     }
 }
 
@@ -269,22 +369,25 @@ impl MessageWriter {
 /// needed because `BufMut` can be read and written incrementally, which
 /// `MessageWriter` does not support.
 #[cfg(feature = "prost-codec")]
-pub struct MessageWriterBuf<'a> {
-    inner: &'a mut MessageWriter,
+pub struct MessageWriterBuf {
+    inner: &'static WriterInternal,
     offset: usize,
 }
 
 #[cfg(feature = "prost-codec")]
-impl<'a> From<&'a mut MessageWriter> for MessageWriterBuf<'a> {
-    fn from(inner: &'a mut MessageWriter) -> MessageWriterBuf<'a> {
-        MessageWriterBuf { inner, offset: 0 }
+impl From<&mut MessageWriter> for MessageWriterBuf {
+    fn from(writer: &mut MessageWriter) -> MessageWriterBuf {
+        MessageWriterBuf {
+            inner: writer.internal,
+            offset: 0,
+        }
     }
 }
 
 #[cfg(feature = "prost-codec")]
-impl<'a> BufMut for MessageWriterBuf<'a> {
+impl BufMut for MessageWriterBuf {
     fn remaining_mut(&self) -> usize {
-        self.inner.write_buffer.len() - self.offset
+        self.inner.write_buffer.unwrap().len() - self.offset
     }
 
     unsafe fn advance_mut(&mut self, cnt: usize) {
@@ -292,7 +395,7 @@ impl<'a> BufMut for MessageWriterBuf<'a> {
     }
 
     unsafe fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.inner.write_buffer[self.offset..]
+        &mut self.inner.write_buffer.unwrap()[self.offset..]
     }
 }
 
@@ -307,26 +410,25 @@ impl<'a> BufMut for MessageWriterBuf<'a> {
 // We track the start and end of an occupied zone (which may have some freed data
 // inside).
 mod alloc {
-    use std::{cell::Cell, mem, ptr, usize};
-
-    use crate::grpc_sys::{self, grpc_slice, grpc_slice_refcount, grpc_slice_refcount_vtable};
+    use super::WriterInternal;
+    use std::{cell::Cell, mem, usize};
 
     // The size of our arenas in number of items per thread.
     // TODO value
     const ARENA_SIZE: u32 = 4000;
 
     thread_local! {
-        // An arena for allocating `VecSlice`s. These are smart-pointer-like objects
-        // which hold a pointer to the data itself.
-        static SLICE_ARENA: [VecSlice; ARENA_SIZE as usize] = unsafe {
-            mem::transmute(mem::zeroed::<[u8; ARENA_SIZE as usize * mem::size_of::<VecSlice>()]>())
+        static WRITER_ARENA: [WriterInternal; ARENA_SIZE as usize] = unsafe {
+            mem::transmute(
+                mem::zeroed::<[u8; ARENA_SIZE as usize * mem::size_of::<WriterInternal>()]>(),
+            )
         };
+
         static ARENA_MIN: Cell<usize> = Cell::new(0);
         static ARENA_MAX: Cell<usize> = Cell::new(0);
     }
 
-    // Returned data is partially initialised. Why is this safe?
-    unsafe fn alloc() -> *mut VecSlice {
+    pub(super) fn alloc_writer() -> *mut WriterInternal {
         let min = ARENA_MIN.with(|i| i.get());
         let index = if min > 0 {
             let index = min - 1;
@@ -336,128 +438,112 @@ mod alloc {
             let max = ARENA_MAX.with(|i| i.get());
             debug_assert!(max <= ARENA_SIZE as usize);
             if max == ARENA_SIZE as usize {
-                // TODO remove
-                eprintln!("boxing");
-                let slice: *mut VecSlice = Box::into_raw(Box::new(mem::zeroed()));
-                (*slice).boxed = ARENA_SIZE;
-                return slice;
+                let mut writer = Box::new(WriterInternal::default());
+                writer.write_buffer = Some(Vec::new());
+                writer.boxed = ARENA_SIZE;
+                writer.count = 1;
+                return Box::into_raw(writer);
             }
 
             ARENA_MAX.with(|i| i.set(max + 1));
             max
         };
 
-        let slice: *mut VecSlice = SLICE_ARENA.with(|a| &a[index] as *const _ as *mut _);
-        debug_assert!((*slice).vtable == ptr::null());
-        (*slice).boxed = index as u32;
-        slice
+        unsafe {
+            let writer: *mut WriterInternal =
+                WRITER_ARENA.with(|a| &a[index] as *const _ as *mut _);
+            debug_assert!((*writer).slice.is_none() && (*writer).count == 0);
+            (*writer).boxed = index as u32;
+            (*writer).count = 1;
+            if (*writer).write_buffer.is_none() {
+                (*writer).write_buffer = Some(Vec::new());
+            } else {
+                (*writer).write_buffer.as_mut().unwrap().set_len(0);
+            }
+            writer
+        }
     }
 
-    unsafe fn free(slice: *mut VecSlice, index: u32) {
-        debug_assert!((*slice).boxed == index && index < ARENA_SIZE);
-        (*slice).vtable = ptr::null();
+    pub(super) fn free_writer(writer: *mut WriterInternal) {
+        let index = unsafe { (*writer).boxed };
+
+        unsafe {
+            debug_assert!((*writer).count == 0);
+            if index == ARENA_SIZE {
+                let writer = Box::from_raw(writer);
+                mem::drop(writer);
+                return;
+            }
+
+            (*writer).slice = None;
+        }
 
         let mut next = ARENA_MAX.with(|i| i.get());
         let mut prev = ARENA_MIN.with(|i| i.get());
         if prev as u32 == index && prev + 1 < next {
-            let prev = SLICE_ARENA.with(|a| {
-                while prev + 1 < next && a[prev].vtable == ptr::null() {
-                    prev += 1
+            let prev = WRITER_ARENA.with(|a| {
+                while prev + 1 < next && a[prev].count == 0 {
+                    prev += 1;
                 }
                 prev
             });
             ARENA_MIN.with(|i| i.set(prev));
-        } else if next as u32 - 1 == index {
-            let next = SLICE_ARENA.with(|a| {
-                while next > 0 && a[next - 1].vtable == ptr::null() {
-                    next -= 1
+        } else if next > 0 && next as u32 - 1 == index {
+            let next = WRITER_ARENA.with(|a| {
+                while next > 0 && a[next - 1].count == 0 {
+                    next -= 1;
+                    if prev == next {
+                        ARENA_MIN.with(|i| i.set(0));
+                        next = 0;
+                        break;
+                    }
                 }
                 next
             });
             ARENA_MAX.with(|i| i.set(next));
         }
-    }
-
-    pub unsafe fn vec_slice(v: Vec<u8>) -> *mut grpc_slice {
-        let mut data = grpc_sys::grpc_slice_grpc_slice_data::default();
-        // FIXME use inlined slices (without allocation) for < 8 bytes.
-        *data.refcounted.as_mut() = grpc_sys::grpc_slice_grpc_slice_data_grpc_slice_refcounted {
-            bytes: v.as_ptr() as *const _ as *mut _,
-            length: v.len(),
-        };
-        let slice = alloc();
-        let result = &mut (*slice).slice;
-        (*result).data = data;
-        (*result).refcount = slice as *mut _;
-        (*slice).vtable = &VEC_SLICE_VTABLE;
-        (*slice).sub_refcount = slice as *mut _;
-        (*slice).vec = Some(v);
-        (*slice).count = 0;
-        result
-    }
-
-    // comment: grpc_slice_refcount
-    #[repr(C)]
-    struct VecSlice {
-        vtable: *const grpc_slice_refcount_vtable,
-        sub_refcount: *mut grpc_slice_refcount,
-        vec: Option<Vec<u8>>,
-        count: u32,
-        boxed: u32,
-        slice: grpc_slice,
-    }
-
-    static VEC_SLICE_VTABLE: grpc_slice_refcount_vtable = grpc_slice_refcount_vtable {
-        ref_: Some(vec_slice_ref),
-        unref: Some(vec_slice_unref),
-        eq: Some(grpc_sys::grpc_slice_default_eq_impl),
-        hash: Some(grpc_sys::grpc_slice_default_hash_impl),
-    };
-
-    unsafe extern "C" fn vec_slice_ref(arg1: *mut ::std::os::raw::c_void) {
-        let refcount = arg1 as *mut VecSlice;
-        (*refcount).count += 1;
-    }
-
-    unsafe extern "C" fn vec_slice_unref(arg1: *mut ::std::os::raw::c_void) {
-        let refcount = arg1 as *mut VecSlice;
-        (*refcount).count -= 1;
-        if (*refcount).count == 0 {
-            let boxed = (*refcount).boxed;
-            if boxed == ARENA_SIZE {
-                let refcount = Box::from_raw(refcount);
-                mem::drop(refcount);
-            } else {
-                let vec = (*refcount).vec.take();
-                mem::drop(vec);
-                free(refcount, boxed);
-            }
-        }
+        debug_assert!(ARENA_MIN.with(|i| i.get()) <= ARENA_MAX.with(|i| i.get()));
     }
 
     #[cfg(test)]
     mod tests {
+        use super::super::*;
         use super::*;
         use std::mem::MaybeUninit;
 
         #[test]
         fn test_alloc() {
-            unsafe {
-                for _ in 0..6 {
-                    alloc();
-                }
-                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
-                assert_eq!(ARENA_MAX.with(|i| i.get()), 6);
-
-                for _ in 0..ARENA_SIZE {
-                    alloc();
-                }
-                // We'll have allocated `ARENA_SIZE + 6` times by now, but the last 6
-                // should have been heap-allocated because the arenas are full.
-                assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
-                assert_eq!(ARENA_MAX.with(|i| i.get()), ARENA_SIZE as usize);
+            for _ in 0..6 {
+                alloc_writer();
             }
+            assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+            assert_eq!(ARENA_MAX.with(|i| i.get()), 6);
+
+            let mut alloced = vec![];
+            for _ in 0..ARENA_SIZE {
+                alloced.push(alloc_writer());
+            }
+            // We'll have allocated `ARENA_SIZE + 6` times by now, but the last 6
+            // should have been heap-allocated because the arenas are full.
+            assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
+            assert_eq!(ARENA_MAX.with(|i| i.get()), ARENA_SIZE as usize);
+
+            assert!(alloced[0] != alloced[1]);
+            assert!(alloced[0] != alloced[5]);
+
             // Test will leak all slices.
+        }
+
+        fn init_writer() -> MessageWriter {
+            let mut writer = MessageWriter::new();
+            let bytes = writer.reserve(5);
+            bytes[0] = 1;
+            bytes[1] = 2;
+            bytes[2] = 3;
+            bytes[3] = 4;
+            bytes[4] = 5;
+
+            writer
         }
 
         #[test]
@@ -467,27 +553,27 @@ mod alloc {
             unsafe {
                 let mut data = vec![];
                 for _ in 0..10 {
-                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                    data.push(init_writer());
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
                 while let Some(datum) = data.pop() {
-                    // We have to ref and unref because the slices are returned with
-                    // 0 refcount.
-                    vec_slice_ref((*datum).refcount as *mut _);
-                    vec_slice_unref((*datum).refcount as *mut _);
+                    vec_slice_unref(datum.internal.as_ptr() as *mut _);
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 0);
 
                 for _ in 0..10 {
-                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                    data.push(init_writer());
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
-                for datum in data.into_iter().skip(2) {
-                    vec_slice_ref((*datum).refcount as *mut _);
-                    vec_slice_unref((*datum).refcount as *mut _);
+                let mut iter = data.into_iter();
+                // Leak two message writers.
+                mem::forget(iter.next().unwrap());
+                mem::forget(iter.next().unwrap());
+                for datum in iter {
+                    vec_slice_unref(datum.internal.as_ptr() as *mut _);
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 2);
@@ -500,25 +586,25 @@ mod alloc {
             unsafe {
                 let mut data = vec![];
                 for _ in 0..10 {
-                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                    data.push(init_writer());
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
-                for datum in data.into_iter().take(5) {
-                    vec_slice_ref((*datum).refcount as *mut _);
-                    vec_slice_unref((*datum).refcount as *mut _);
+                for i in 0..5 {
+                    let datum = &data[i];
+                    vec_slice_unref(datum.internal.as_ptr() as *mut _);
                 }
+                mem::forget(data);
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
                 let mut data = vec![];
                 for _ in 0..3 {
-                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                    data.push(init_writer());
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 2);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
                 while let Some(datum) = data.pop() {
-                    vec_slice_ref((*datum).refcount as *mut _);
-                    vec_slice_unref((*datum).refcount as *mut _);
+                    vec_slice_unref(datum.internal.as_ptr() as *mut _);
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
@@ -533,19 +619,20 @@ mod alloc {
             unsafe {
                 let mut data = vec![];
                 for _ in 0..10 {
-                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                    data.push(init_writer());
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 0);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
-                for datum in data.into_iter().take(5) {
-                    let bb = grpc_sys::grpc_raw_byte_buffer_create(datum, 1);
+                for _ in 0..5 {
+                    let mut datum = data.remove(0);
+                    let bb = datum.byte_buffer();
                     let mut reader = MaybeUninit::uninit();
                     grpc_sys::grpc_byte_buffer_reader_init(reader.as_mut_ptr(), bb);
                     let mut reader = reader.assume_init();
                     let mut slice = MaybeUninit::uninit();
                     assert_eq!(
                         grpc_sys::grpc_byte_buffer_reader_next(&mut reader, slice.as_mut_ptr()),
-                        1
+                        1,
                     );
                     let slice = slice.assume_init();
                     let bytes = slice.data.refcounted.as_ref().bytes;
@@ -558,18 +645,21 @@ mod alloc {
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                mem::forget(data);
                 let mut data = vec![];
                 for _ in 0..3 {
-                    data.push(vec_slice(vec![1, 2, 3, 4, 5]));
+                    data.push(init_writer());
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 2);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
                 while let Some(datum) = data.pop() {
-                    let bb = grpc_sys::grpc_raw_byte_buffer_create(datum, 1);
+                    let bb =
+                        grpc_sys::grpc_raw_byte_buffer_create(datum.internal.as_ptr() as *mut _, 1);
                     grpc_sys::grpc_byte_buffer_destroy(bb);
                 }
                 assert_eq!(ARENA_MIN.with(|i| i.get()), 5);
                 assert_eq!(ARENA_MAX.with(|i| i.get()), 10);
+                mem::forget(data);
             }
         }
     }
@@ -581,7 +671,7 @@ mod tests {
 
     impl MessageWriter {
         fn len(&self) -> usize {
-            self.write_buffer.len()
+            unsafe { self.internal.as_ref().write_buffer.as_ref().unwrap().len() }
         }
     }
 
@@ -693,7 +783,8 @@ mod tests {
         let bytes = writer.reserve(3);
         bytes[2] = 42;
         assert_eq!(writer.len(), 3);
-        writer.clear();
+        // Leaks the byte buffer.
+        unsafe { writer.byte_buffer() };
         assert_eq!(writer.len(), 0);
     }
 

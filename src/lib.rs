@@ -28,6 +28,9 @@ framework that puts mobile and HTTP/2 first. grpcio is built on [gRPC Core] and 
 
 */
 
+// TODO can we do without this?
+#![feature(optin_builtin_traits)]
+
 #![allow(clippy::new_without_default)]
 #![allow(clippy::new_without_default)]
 #![allow(clippy::cast_lossless)]
